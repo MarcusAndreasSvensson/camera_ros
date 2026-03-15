@@ -57,6 +57,8 @@
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <fcntl.h>  // for open()
+#include <time.h>  // for clock_gettime, CLOCK_BOOTTIME, CLOCK_REALTIME
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -70,6 +72,13 @@ class NodeOptions;
 
 namespace camera
 {
+
+// LIV_handhold time synchronization struct (must match livox_ros_driver2)
+typedef struct {
+  int64_t high;
+  int64_t low;
+} time_stamp;
+
 class CameraNode : public rclcpp::Node
 {
 public:
@@ -97,6 +106,10 @@ private:
 
   bool use_node_time;
 
+  // Rolling shutter mid-exposure offset in nanoseconds (configurable via parameter)
+  // This compensates for the time between first line readout and middle of frame
+  int64_t rolling_shutter_offset_ns_;
+
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_image_compressed;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
@@ -115,6 +128,11 @@ private:
 
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
+
+  // LIV_handhold time synchronization (shared memory with LiDAR)
+  bool use_lidar_timestamp_;
+  time_stamp *lidar_timeshare_ptr_;
+  bool lidar_timeshare_opened_;
 
   void
   requestComplete(libcamera::Request *const request);
@@ -323,6 +341,61 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   param_descr_use_node_time.description = "use node time instead of sensor timestamp for image messages";
   param_descr_use_node_time.read_only = true;
   use_node_time = declare_parameter<bool>("use_node_time", false, param_descr_use_node_time);
+
+  // Rolling shutter mid-exposure offset parameter (in microseconds for easier configuration)
+  // Default 0 = no compensation. Set to half of sensor readout time for mid-exposure timestamps.
+  // Example: IMX708 @ 4K has ~57ms readout, so use 28500µs for mid-exposure timestamping.
+  // Example: IMX708 @ 2x2 binned (1296 lines) has ~17ms readout, so use 8500µs.
+  rcl_interfaces::msg::ParameterDescriptor param_descr_rs_offset;
+  param_descr_rs_offset.description = 
+    "Rolling shutter offset in microseconds. Set to half your sensor readout time "
+    "to timestamp at mid-frame exposure. IMX708 @ 4K ≈ 28500µs, @ 2x2 binned ≈ 8500µs. "
+    "Add half of exposure time for center-of-exposure timestamps.";
+  param_descr_rs_offset.read_only = true;
+  int64_t rs_offset_us = declare_parameter<int64_t>("rolling_shutter_offset_us", 0, param_descr_rs_offset);
+  rolling_shutter_offset_ns_ = rs_offset_us * 1000LL;  // Convert µs to ns
+
+  if (rolling_shutter_offset_ns_ != 0) {
+    RCLCPP_INFO_STREAM(get_logger(), 
+      "Rolling shutter compensation enabled: " << rs_offset_us << "µs offset applied to timestamps");
+  }
+
+  // LIV_handhold LiDAR timestamp synchronization parameter
+  // When enabled, camera timestamps are taken from the LiDAR's shared memory file
+  rcl_interfaces::msg::ParameterDescriptor param_descr_lidar_sync;
+  param_descr_lidar_sync.description = 
+    "Use LiDAR timestamp from shared memory file (LIV_handhold method). "
+    "Requires livox_ros_driver2 with timeshare support running.";
+  param_descr_lidar_sync.read_only = true;
+  use_lidar_timestamp_ = declare_parameter<bool>("use_lidar_timestamp", false, param_descr_lidar_sync);
+  lidar_timeshare_ptr_ = nullptr;
+  lidar_timeshare_opened_ = false;
+
+  if (use_lidar_timestamp_) {
+    // Open the shared memory file created by livox_ros_driver2
+    const char *user_name = getlogin();
+    std::string timeshare_path = "/home/" + std::string(user_name) + "/timeshare";
+    
+    int fd = open(timeshare_path.c_str(), O_RDONLY);
+    if (fd == -1) {
+      RCLCPP_WARN_STREAM(get_logger(), 
+        "LiDAR timestamp sync enabled but timeshare file not found at: " << timeshare_path
+        << ". Will retry on first frame. Make sure livox_ros_driver2 is running.");
+    } else {
+      lidar_timeshare_ptr_ = (time_stamp *)mmap(NULL, sizeof(time_stamp),
+          PROT_READ, MAP_SHARED, fd, 0);
+      close(fd);
+      
+      if (lidar_timeshare_ptr_ == MAP_FAILED) {
+        RCLCPP_ERROR_STREAM(get_logger(), "Failed to mmap timeshare file");
+        lidar_timeshare_ptr_ = nullptr;
+      } else {
+        lidar_timeshare_opened_ = true;
+        RCLCPP_INFO_STREAM(get_logger(), 
+          "LiDAR timestamp sync enabled, reading from: " << timeshare_path);
+      }
+    }
+  }
 
   // publisher for raw and compressed image
   pub_image = this->create_publisher<sensor_msgs::msg::Image>("~/image_raw", 1);
@@ -606,6 +679,13 @@ CameraNode::~CameraNode()
   for (const auto &e : buffer_info)
     if (munmap(e.second.data, e.second.size) == -1)
       std::cerr << "munmap failed: " << std::strerror(errno) << std::endl;
+
+  // Clean up LiDAR timeshare shared memory
+  if (lidar_timeshare_opened_ && lidar_timeshare_ptr_ != nullptr) {
+    munmap(lidar_timeshare_ptr_, sizeof(time_stamp));
+    lidar_timeshare_ptr_ = nullptr;
+    lidar_timeshare_opened_ = false;
+  }
 }
 
 void
@@ -640,20 +720,72 @@ CameraNode::process(libcamera::Request *const request)
       std_msgs::msg::Header hdr;
       hdr.frame_id = frame_id;
 
-      // if using sensor timestamps, get the sensor timestamp from the request metadata
-      int64_t sensor_latency = 0;
-      if (!use_node_time) {
-        const libcamera::ControlList &req_metadata = request->metadata();
-        if (const std::optional<int64_t> sensor_ts = req_metadata.get(libcamera::controls::SensorTimestamp)) {
-          sensor_latency = rclcpp::Clock(RCL_STEADY_TIME).now().nanoseconds() - sensor_ts.value();
+      // Timestamp calculation with multiple modes:
+      // 1. LiDAR timestamp sync (LIV_handhold method) - highest priority when enabled
+      // 2. Sensor timestamp with clock domain conversion
+      // 3. Node time fallback
+      if (use_lidar_timestamp_) {
+        // LIV_handhold method: read timestamp from LiDAR's shared memory
+        // Try to open timeshare file if not already opened
+        if (!lidar_timeshare_opened_) {
+          const char *user_name = getlogin();
+          std::string timeshare_path = "/home/" + std::string(user_name) + "/timeshare";
+          int fd = open(timeshare_path.c_str(), O_RDONLY);
+          if (fd != -1) {
+            lidar_timeshare_ptr_ = (time_stamp *)mmap(NULL, sizeof(time_stamp),
+                PROT_READ, MAP_SHARED, fd, 0);
+            close(fd);
+            if (lidar_timeshare_ptr_ != MAP_FAILED) {
+              lidar_timeshare_opened_ = true;
+              RCLCPP_INFO_STREAM(get_logger(), 
+                "LiDAR timestamp sync connected to: " << timeshare_path);
+            } else {
+              lidar_timeshare_ptr_ = nullptr;
+            }
+          }
         }
-        else {
-          RCLCPP_WARN_STREAM_ONCE(get_logger(), "sensor timestamp not available, falling back to node time as reference");
+
+        if (lidar_timeshare_opened_ && lidar_timeshare_ptr_ != nullptr && lidar_timeshare_ptr_->low != 0) {
+          // Use LiDAR timestamp directly (already in nanoseconds, GPS/PTP time domain)
+          hdr.stamp = rclcpp::Time(lidar_timeshare_ptr_->low, RCL_SYSTEM_TIME);
+        } else {
+          // Fallback to node time if timeshare not available
+          RCLCPP_WARN_STREAM_THROTTLE(get_logger(), *get_clock(), 5000,
+            "LiDAR timestamp sync enabled but timeshare not available, using node time");
+          hdr.stamp = this->now();
         }
       }
-
-      // Adjust timestamp by the sensor latency
-      hdr.stamp = this->now() - rclcpp::Duration::from_nanoseconds(sensor_latency);
+      else if (use_node_time) {
+        // Simple mode: use current node time (adds processing latency to timestamp)
+        hdr.stamp = this->now();
+      }
+      else {
+        const libcamera::ControlList &req_metadata = request->metadata();
+        if (const std::optional<int64_t> sensor_ts = req_metadata.get(libcamera::controls::SensorTimestamp)) {
+          // Dynamic BOOTTIME→REALTIME conversion:
+          // libcamera's SensorTimestamp is in CLOCK_BOOTTIME domain, but ROS uses CLOCK_REALTIME.
+          // When PPS disciplines CLOCK_REALTIME, the offset between clocks changes.
+          // We compute this offset dynamically for each frame to handle clock adjustments.
+          struct timespec ts_boottime, ts_realtime;
+          clock_gettime(CLOCK_BOOTTIME, &ts_boottime);
+          clock_gettime(CLOCK_REALTIME, &ts_realtime);
+          
+          int64_t boottime_now_ns = static_cast<int64_t>(ts_boottime.tv_sec) * 1000000000LL + ts_boottime.tv_nsec;
+          int64_t realtime_now_ns = static_cast<int64_t>(ts_realtime.tv_sec) * 1000000000LL + ts_realtime.tv_nsec;
+          int64_t clock_offset_ns = realtime_now_ns - boottime_now_ns;
+          
+          // Convert sensor timestamp from BOOTTIME to REALTIME domain
+          // and add rolling shutter mid-exposure offset
+          int64_t final_timestamp_ns = sensor_ts.value() + clock_offset_ns + rolling_shutter_offset_ns_;
+          
+          hdr.stamp = rclcpp::Time(final_timestamp_ns, RCL_SYSTEM_TIME);
+        }
+        else {
+          RCLCPP_WARN_STREAM_ONCE(get_logger(), 
+            "SensorTimestamp not available from libcamera, falling back to node time");
+          hdr.stamp = this->now();
+        }
+      }
 
       // prepare image messages
       const libcamera::StreamConfiguration &cfg = stream->configuration();
