@@ -129,10 +129,17 @@ private:
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
 
-  // LIV_handhold time synchronization (shared memory with LiDAR)
+  // LiDAR PTP time synchronization via SensorTimestamp + calibrated offset.
+  // The timeshare file (written by the Hesai driver at ~10Hz) provides PTP timestamps.
+  // We use it only for offset calibration, not per-frame stamping.
   bool use_lidar_timestamp_;
   time_stamp *lidar_timeshare_ptr_;
   bool lidar_timeshare_opened_;
+
+  // BOOTTIME→PTP offset state (EMA-smoothed)
+  double boottime_to_ptp_offset_ns_;
+  bool ptp_offset_initialized_;
+  int64_t last_ptp_reading_ns_;
 
   void
   requestComplete(libcamera::Request *const request);
@@ -364,12 +371,16 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   // When enabled, camera timestamps are taken from the LiDAR's shared memory file
   rcl_interfaces::msg::ParameterDescriptor param_descr_lidar_sync;
   param_descr_lidar_sync.description = 
-    "Use LiDAR timestamp from shared memory file (LIV_handhold method). "
-    "Requires livox_ros_driver2 with timeshare support running.";
+    "Stamp images in LiDAR PTP time domain using SensorTimestamp + calibrated offset. "
+    "The offset is learned from the Hesai driver's timeshare file (EMA-smoothed). "
+    "Requires hesai_ros_driver with timeshare support running.";
   param_descr_lidar_sync.read_only = true;
   use_lidar_timestamp_ = declare_parameter<bool>("use_lidar_timestamp", false, param_descr_lidar_sync);
   lidar_timeshare_ptr_ = nullptr;
   lidar_timeshare_opened_ = false;
+  boottime_to_ptp_offset_ns_ = 0.0;
+  ptp_offset_initialized_ = false;
+  last_ptp_reading_ns_ = 0;
 
   if (use_lidar_timestamp_) {
     // Open the shared memory file created by livox_ros_driver2
@@ -720,13 +731,12 @@ CameraNode::process(libcamera::Request *const request)
       std_msgs::msg::Header hdr;
       hdr.frame_id = frame_id;
 
-      // Timestamp calculation with multiple modes:
-      // 1. LiDAR timestamp sync (LIV_handhold method) - highest priority when enabled
-      // 2. Sensor timestamp with clock domain conversion
+      // Timestamp modes:
+      // 1. LiDAR PTP sync: SensorTimestamp + EMA-smoothed BOOTTIME→PTP offset
+      // 2. Sensor timestamp with BOOTTIME→REALTIME conversion
       // 3. Node time fallback
       if (use_lidar_timestamp_) {
-        // LIV_handhold method: read timestamp from LiDAR's shared memory
-        // Try to open timeshare file if not already opened
+        // Lazy-open the timeshare mmap if not already done
         if (!lidar_timeshare_opened_) {
           const char *user_name = getlogin();
           std::string timeshare_path = "/home/" + std::string(user_name) + "/timeshare";
@@ -737,22 +747,69 @@ CameraNode::process(libcamera::Request *const request)
             close(fd);
             if (lidar_timeshare_ptr_ != MAP_FAILED) {
               lidar_timeshare_opened_ = true;
-              RCLCPP_INFO_STREAM(get_logger(), 
-                "LiDAR timestamp sync connected to: " << timeshare_path);
+              RCLCPP_INFO_STREAM(get_logger(),
+                "LiDAR timeshare connected for offset calibration: " << timeshare_path);
             } else {
               lidar_timeshare_ptr_ = nullptr;
             }
           }
         }
 
-        if (lidar_timeshare_opened_ && lidar_timeshare_ptr_ != nullptr && lidar_timeshare_ptr_->low != 0) {
-          // Use LiDAR timestamp directly (already in nanoseconds, GPS/PTP time domain)
-          hdr.stamp = rclcpp::Time(lidar_timeshare_ptr_->low, RCL_SYSTEM_TIME);
+        // Update BOOTTIME→PTP offset when the timeshare value changes (~10Hz from Hesai driver)
+        if (lidar_timeshare_opened_ && lidar_timeshare_ptr_ != nullptr
+            && lidar_timeshare_ptr_->low != 0) {
+          int64_t ptp_ns = lidar_timeshare_ptr_->low;
+          if (ptp_ns != last_ptp_reading_ns_) {
+            struct timespec ts_boot;
+            clock_gettime(CLOCK_BOOTTIME, &ts_boot);
+            int64_t boottime_now_ns = static_cast<int64_t>(ts_boot.tv_sec) * 1000000000LL
+                                    + ts_boot.tv_nsec;
+            double new_offset = static_cast<double>(ptp_ns) - static_cast<double>(boottime_now_ns);
+
+            if (!ptp_offset_initialized_) {
+              boottime_to_ptp_offset_ns_ = new_offset;
+              ptp_offset_initialized_ = true;
+              RCLCPP_INFO_STREAM(get_logger(),
+                "PTP offset initialized: " << (new_offset / 1e6) << " ms "
+                << "(PTP=" << (ptp_ns / 1e9) << "s, BOOT=" << (boottime_now_ns / 1e9) << "s)");
+            } else {
+              constexpr double kAlpha = 0.02;
+              boottime_to_ptp_offset_ns_ =
+                  kAlpha * new_offset + (1.0 - kAlpha) * boottime_to_ptp_offset_ns_;
+            }
+            last_ptp_reading_ns_ = ptp_ns;
+          }
+        }
+
+        // Per-frame: apply SensorTimestamp (kernel BOOTTIME at exposure start) + calibrated offset
+        const libcamera::ControlList &ts_metadata = request->metadata();
+        if (ptp_offset_initialized_) {
+          if (const auto sensor_ts = ts_metadata.get(libcamera::controls::SensorTimestamp)) {
+            int64_t final_ts = sensor_ts.value()
+                             + rolling_shutter_offset_ns_
+                             + static_cast<int64_t>(boottime_to_ptp_offset_ns_);
+            hdr.stamp = rclcpp::Time(final_ts, RCL_SYSTEM_TIME);
+          } else {
+            RCLCPP_WARN_STREAM_ONCE(get_logger(),
+              "SensorTimestamp unavailable, using BOOTTIME + PTP offset");
+            struct timespec ts_boot;
+            clock_gettime(CLOCK_BOOTTIME, &ts_boot);
+            int64_t boot_ns = static_cast<int64_t>(ts_boot.tv_sec) * 1000000000LL
+                            + ts_boot.tv_nsec;
+            hdr.stamp = rclcpp::Time(boot_ns + static_cast<int64_t>(boottime_to_ptp_offset_ns_),
+                                     RCL_SYSTEM_TIME);
+          }
         } else {
-          // Fallback to node time if timeshare not available
-          RCLCPP_WARN_STREAM_THROTTLE(get_logger(), *get_clock(), 5000,
-            "LiDAR timestamp sync enabled but timeshare not available, using node time");
-          hdr.stamp = this->now();
+          if (lidar_timeshare_opened_ && lidar_timeshare_ptr_ != nullptr
+              && lidar_timeshare_ptr_->low != 0) {
+            hdr.stamp = rclcpp::Time(lidar_timeshare_ptr_->low, RCL_SYSTEM_TIME);
+            RCLCPP_WARN_STREAM_THROTTLE(get_logger(), *get_clock(), 5000,
+              "PTP offset not yet calibrated, using raw timeshare timestamp");
+          } else {
+            RCLCPP_WARN_STREAM_THROTTLE(get_logger(), *get_clock(), 5000,
+              "LiDAR timeshare not available, using node time");
+            hdr.stamp = this->now();
+          }
         }
       }
       else if (use_node_time) {
